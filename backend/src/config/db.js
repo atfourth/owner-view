@@ -1,3 +1,5 @@
+
+import fs from 'node:fs';
 import pg from 'pg';
 import { env } from './env.js';
 
@@ -5,9 +7,12 @@ const { Pool } = pg;
 
 export const pool = new Pool({
   connectionString: env.databaseUrl,
-  options: `-c timezone=${process.env.DB_TIMEZONE || 'Asia/Kolkata'}`, 
+  options: `-c timezone=${process.env.DB_TIMEZONE || 'Asia/Kolkata'}`,
   ssl: env.nodeEnv === 'production' && process.env.DB_SSL === 'true'
-    ? { rejectUnauthorized: true }
+    ? {
+        rejectUnauthorized: true,
+        ca: fs.readFileSync('/etc/secrets/supabase-ca.crt', 'utf8'),
+      }
     : false,
 });
 
