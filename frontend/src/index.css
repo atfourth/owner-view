@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@layer base { body { @apply bg-slate-50 text-slate-900 antialiased; } }
+.card { @apply bg-white border border-slate-200 rounded-xl shadow-sm; }
+.input-field { @apply w-full rounded-lg bg-white border border-slate-300 px-3.5 py-2.5 text-sm text-slate-900 placeholder-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500; }
+.btn-primary { @apply inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors; }
+.btn-secondary { @apply inline-flex items-center justify-center gap-2 rounded-lg bg-white border border-slate-300 px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition-colors; }
+/* The original page components used dark palette utility classes. Re-map those classes for the unified light UI. */
+.bg-slate-950,.bg-slate-900,.bg-slate-900\/90 { background-color:#fff !important; }
+.bg-slate-800,.bg-slate-800\/70,.bg-slate-800\/40 { background-color:#f8fafc !important; }
+.text-white,.text-slate-100 { color:#0f172a !important; }
+.text-slate-300 { color:#475569 !important; }
+.text-slate-400 { color:#64748b !important; }
+.text-emerald-700,.text-emerald-700,.text-emerald-600 { color:#047857 !important; }
+.border-slate-800,.border-slate-700 { border-color:#e2e8f0 !important; }
+.hover\:bg-slate-800\/70:hover,.hover\:bg-slate-800\/40:hover { background-color:#ecfdf5 !important; }

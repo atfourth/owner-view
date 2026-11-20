@@ -1,0 +1,3 @@
+const buckets=new Map();
+export function rateLimit({windowMs=15*60*1000,max=10,message='Too many requests. Please try again later.'}={}){return(req,res,next)=>{const now=Date.now();const key=`${req.ip}:${req.baseUrl}${req.path}`;let b=buckets.get(key);if(!b||now-b.start>windowMs){b={start:now,count:0};buckets.set(key,b);}b.count++;res.setHeader('RateLimit-Limit',max);res.setHeader('RateLimit-Remaining',Math.max(0,max-b.count));if(b.count>max)return res.status(429).json({message});next();};}
+setInterval(()=>{const now=Date.now();for(const[k,v]of buckets)if(now-v.start>60*60*1000)buckets.delete(k);},10*60*1000).unref?.();

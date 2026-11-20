@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ironpulse_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ironpulse_gym}
+      POSTGRES_USER: ${POSTGRES_USER:-ironpulse_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_this_local_db_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ironpulse_admin} -d ${POSTGRES_DB:-ironpulse_gym}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ironpulse_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ironpulse_admin}:${POSTGRES_PASSWORD:-change_this_local_db_password}@postgres:5432/${POSTGRES_DB:-ironpulse_gym}
+      JWT_SECRET: ${JWT_SECRET:-replace_with_a_long_random_secret_string_at_least_32_chars}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-replace_with_a_different_random_secret_at_least_32_chars}
+      DB_TIMEZONE: ${DB_TIMEZONE:-Asia/Kolkata}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+    ports:
+      - "5000:5000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+    container_name: ironpulse_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  postgres_data:

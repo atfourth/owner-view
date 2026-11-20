@@ -1,0 +1,1 @@
+-- Demo seed data disabled in the multi-tenant edition. Register a gym owner account instead.
