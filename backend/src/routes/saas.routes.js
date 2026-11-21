@@ -160,6 +160,83 @@ const paymentAccess=[auth,moduleGate('payments')];
 r.get('/payments',...paymentAccess,async(req,res,next)=>{try{const q=await query(`SELECT p.*,COALESCE(u.full_name,tv.full_name) full_name,COALESCE(u.member_code,'TRIAL') member_code FROM payments p LEFT JOIN users u ON u.id=p.user_id AND u.gym_id=p.gym_id LEFT JOIN trial_visitors tv ON tv.id=p.trial_visitor_id AND tv.gym_id=p.gym_id WHERE p.gym_id=$1 ORDER BY p.created_at DESC LIMIT 500`,[gym(req)]);res.json({payments:q.rows});}catch(e){next(e);}});
 r.post('/payments',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({member_id:z.string().uuid(),amount:z.coerce.number().positive(),payment_method:z.enum(['cash','upi','bank_transfer','card','online']),status:z.enum(['paid','pending']).default('paid'),description:z.string().optional()}).parse(req.body);const m=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[d.member_id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const q=await query(`INSERT INTO payments(gym_id,invoice_number,user_id,amount,total_amount,payment_method,status,paid_at,description) VALUES($1,$2,$3,$4,$4,$5,$6,CASE WHEN $6='paid' THEN NOW() ELSE NULL END,$7) RETURNING *`,[gym(req),invoiceNumber(),d.member_id,d.amount,d.payment_method,d.status,d.description||'Membership payment']);res.status(201).json({payment:q.rows[0]});}catch(e){next(e);}});
 r.patch('/payments/:id/mark-paid',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({payment_method:z.enum(['cash','upi','bank_transfer','card','online']).default('cash')}).parse(req.body);const q=await query("UPDATE payments SET status='paid',payment_method=$1,paid_at=NOW() WHERE id=$2 AND gym_id=$3 AND status='pending' RETURNING *",[d.payment_method,req.params.id,gym(req)]);if(!q.rowCount)return res.status(404).json({message:'Pending payment not found'});res.json({payment:q.rows[0]});}catch(e){next(e);}});
+r.post('/payments/:id/partial',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{
+  const c=await pool.connect();
+  try{
+    const d=z.object({
+      amount:z.coerce.number().positive(),
+      payment_method:z.enum(['cash','upi','bank_transfer','card','online'])
+    }).parse(req.body);
+
+    await c.query('BEGIN');
+
+    const q=await c.query(
+      `SELECT * FROM payments
+       WHERE id=$1 AND gym_id=$2 AND status='pending'
+       FOR UPDATE`,
+      [req.params.id,gym(req)]
+    );
+
+    if(!q.rowCount){
+      await c.query('ROLLBACK');
+      return res.status(404).json({message:'Pending payment not found'});
+    }
+
+    const invoice=q.rows[0];
+    const outstanding=Number(invoice.total_amount);
+
+    if(d.amount>outstanding){
+      await c.query('ROLLBACK');
+      return res.status(400).json({
+        message:`Amount cannot exceed outstanding balance of ₹${outstanding.toFixed(2)}`
+      });
+    }
+
+    const remaining=Number((outstanding-d.amount).toFixed(2));
+
+    const received=await c.query(
+      `INSERT INTO payments(
+        gym_id,invoice_number,user_id,subscription_id,
+        trial_visitor_id,amount,total_amount,payment_method,
+        status,paid_at,description
+      )
+      VALUES($1,$2,$3,$4,$5,$6,$6,$7,'paid',NOW(),$8)
+      RETURNING *`,
+      [
+        gym(req),
+        invoiceNumber(),
+        invoice.user_id,
+        invoice.subscription_id,
+        invoice.trial_visitor_id,
+        d.amount,
+        d.payment_method,
+        `Partial payment against invoice ${invoice.invoice_number}`
+      ]
+    );
+
+    const updated=await c.query(
+      `UPDATE payments
+       SET amount=$1,total_amount=$1
+       WHERE id=$2 AND gym_id=$3 AND status='pending'
+       RETURNING *`,
+      [remaining,invoice.id,gym(req)]
+    );
+
+    await c.query('COMMIT');
+
+    res.status(201).json({
+      message:remaining===0?'Payment completed successfully':'Partial payment recorded successfully',
+      payment:received.rows[0],
+      outstanding:updated.rows[0]
+    });
+  }catch(e){
+    await c.query('ROLLBACK').catch(()=>{});
+    next(e);
+  }finally{
+    c.release();
+  }
+});
+
 r.post('/payments/link',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const enabled=await query("SELECT enabled FROM gym_modules WHERE gym_id=$1 AND module_key='online_payments'",[gym(req)]);if(!enabled.rowCount||!enabled.rows[0].enabled)return res.status(403).json({message:'Enable online payments in Settings first'});const d=z.object({member_id:z.string().uuid(),amount:z.coerce.number().positive(),description:z.string().optional()}).parse(req.body);const cfg=await integration(gym(req),'razorpay');if(!cfg)return res.status(409).json({message:'Configure Razorpay in Settings first'});const m=await query("SELECT u.id,u.full_name,u.phone,u.email,u.whatsapp_opt_in,ms.id subscription_id,mp.price plan_price FROM users u LEFT JOIN LATERAL(SELECT id,plan_id FROM member_subscriptions WHERE gym_id=u.gym_id AND user_id=u.id ORDER BY created_at DESC LIMIT 1) ms ON TRUE LEFT JOIN membership_plans mp ON mp.id=ms.plan_id AND mp.gym_id=u.gym_id WHERE u.id=$1 AND u.gym_id=$2 AND u.role='member'",[d.member_id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const resp=await fetch('https://api.razorpay.com/v1/payment_links',{method:'POST',headers:{Authorization:`Basic ${Buffer.from(`${cfg.keyId}:${cfg.keySecret}`).toString('base64')}`,'Content-Type':'application/json'},body:JSON.stringify({amount:Math.round(d.amount*100),currency:'INR',description:d.description||'Gym membership payment',customer:{name:m.rows[0].full_name,contact:m.rows[0].phone,email:m.rows[0].email||undefined},notify:{sms:false,email:false},reminder_enable:true})});const link=await resp.json();if(!resp.ok)return res.status(502).json({message:link.error?.description||'Payment link creation failed'});const renewalSubId=m.rows[0].subscription_id&&Number(d.amount)>=Number(m.rows[0].plan_price||Infinity)?m.rows[0].subscription_id:null;const p=(await query("INSERT INTO payments(gym_id,invoice_number,user_id,subscription_id,amount,total_amount,payment_method,status,paid_at,description) VALUES($1,$2,$3,$4,$5,$5,'online','pending',NULL,$6) RETURNING id",[gym(req),invoiceNumber(),d.member_id,renewalSubId,d.amount,d.description||'Online payment link'])).rows[0];await query('INSERT INTO payment_orders(gym_id,payment_id,provider_order_id,amount_paise) VALUES($1,$2,$3,$4)',[gym(req),p.id,link.id,Math.round(d.amount*100)]);let whatsappSent=false;try{const waModule=await query("SELECT enabled FROM gym_modules WHERE gym_id=$1 AND module_key='whatsapp'",[gym(req)]);const wa=waModule.rows[0]?.enabled?await integration(gym(req),'whatsapp'):null;if(wa?.paymentLinkTemplate&&m.rows[0].whatsapp_opt_in){const messageId=await sendWhatsApp(gym(req),m.rows[0].phone,wa.paymentLinkTemplate,[m.rows[0].full_name,link.short_url,String(d.amount)]);await logNotification(gym(req),m.rows[0].phone,'payment_link',p.id,'sent',null,messageId);whatsappSent=true;}}catch(e){await logNotification(gym(req),m.rows[0].phone,'payment_link',p.id,'failed',e.message,null);}res.status(201).json({payment_id:p.id,short_url:link.short_url,whatsapp_sent:whatsappSent});}catch(e){next(e);}});
 r.post('/payments/razorpay-webhook',async(req,res)=>{try{const g=req.query.gym;if(!g)return res.status(400).send('Missing gym');const cfg=await integration(g,'razorpay');if(!cfg)return res.status(404).send('Not configured');const sig=req.headers['x-razorpay-signature'];const expected=crypto.createHmac('sha256',cfg.webhookSecret).update(req.rawBody||JSON.stringify(req.body)).digest('hex');if(!safeEqual(sig,expected))return res.status(400).send('Invalid signature');const ev=req.body;let providerOrderId=null;if(ev.event==='payment_link.paid')providerOrderId=ev.payload?.payment_link?.entity?.id;if(ev.event==='payment.captured')providerOrderId=ev.payload?.payment?.entity?.order_id;if(providerOrderId)await reconcilePayment(g,providerOrderId);res.json({received:true});}catch(e){console.error('Razorpay webhook error:',e.message);res.status(500).json({message:'Webhook processing failed'});}});
 
