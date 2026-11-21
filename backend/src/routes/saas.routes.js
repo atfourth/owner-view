@@ -215,10 +215,13 @@ r.post('/payments/:id/partial',...paymentAccess,authorize('admin','staff'),async
     );
 
     const updated=await c.query(
-      `UPDATE payments
-       SET amount=$1,total_amount=$1
-       WHERE id=$2 AND gym_id=$3 AND status='pending'
-       RETURNING *`,
+      ``UPDATE payments
+ SET amount=$1,
+     total_amount=$1,
+     status=CASE WHEN $1=0 THEN 'paid' ELSE 'pending' END,
+     paid_at=CASE WHEN $1=0 THEN NOW() ELSE NULL END
+ WHERE id=$2 AND gym_id=$3 AND status='pending'
+ RETURNING *`,
       [remaining,invoice.id,gym(req)]
     );
 
