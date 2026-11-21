@@ -59,7 +59,92 @@ r.get('/plans',auth,async(req,res,next)=>{try{res.json({plans:(await query(`SELE
 r.post('/plans',auth,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({name:z.string().min(2),description:z.string().optional().default(''),duration_days:z.coerce.number().int().positive(),price:z.coerce.number().nonnegative(),features:z.array(z.string()).default([]),is_active:z.boolean().default(true)}).parse(req.body);const q=await query(`INSERT INTO membership_plans(gym_id,name,description,duration_days,price,currency,features,is_active) VALUES($1,$2,$3,$4,$5,'INR',$6::jsonb,$7) RETURNING *`,[gym(req),d.name,d.description,d.duration_days,d.price,JSON.stringify(d.features),d.is_active]);res.status(201).json({plan:q.rows[0]});}catch(e){next(e);}});
 r.patch('/plans/:id',auth,admin,async(req,res,next)=>{try{const d=z.object({name:z.string().min(2).optional(),description:z.string().optional(),duration_days:z.coerce.number().int().positive().optional(),price:z.coerce.number().nonnegative().optional(),is_active:z.boolean().optional()}).parse(req.body);const keys=Object.keys(d);if(!keys.length)return res.status(400).json({message:'No updates'});const vals=keys.map(k=>d[k]);const set=keys.map((k,i)=>`${k}=$${i+1}`).join(',');const q=await query(`UPDATE membership_plans SET ${set},updated_at=NOW() WHERE id=$${keys.length+1} AND gym_id=$${keys.length+2} RETURNING *`,[...vals,req.params.id,gym(req)]);if(!q.rowCount)return res.status(404).json({message:'Plan not found'});res.json({plan:q.rows[0]});}catch(e){next(e);}});
 r.get('/members',auth,async(req,res,next)=>{try{const s=String(req.query.search||'').trim(),status=String(req.query.status||'');const q=await query(`SELECT u.id,u.member_code,u.full_name,u.email,u.phone,u.whatsapp_opt_in,CASE WHEN u.status='frozen' THEN 'frozen' WHEN ms.end_date<CURRENT_DATE AND ms.status='active' THEN 'expired' ELSE u.status END status,u.created_at,ms.id subscription_id,ms.plan_id,ms.start_date,ms.end_date,ms.status subscription_status,mp.name plan_name,mp.price plan_price,mp.duration_days plan_duration_days,COALESCE((SELECT SUM(p.total_amount) FROM payments p WHERE p.gym_id=u.gym_id AND p.user_id=u.id AND p.status='paid'),0)::numeric(12,2) total_paid,COALESCE((SELECT SUM(p.total_amount) FROM payments p WHERE p.gym_id=u.gym_id AND p.user_id=u.id AND p.status='pending'),0)::numeric(12,2) pending_amount FROM users u LEFT JOIN LATERAL(SELECT * FROM member_subscriptions WHERE gym_id=u.gym_id AND user_id=u.id ORDER BY created_at DESC LIMIT 1) ms ON TRUE LEFT JOIN membership_plans mp ON mp.id=ms.plan_id AND mp.gym_id=u.gym_id WHERE u.gym_id=$1 AND u.role='member' AND ($2='' OR u.full_name ILIKE '%'||$2||'%' OR u.phone ILIKE '%'||$2||'%' OR u.member_code ILIKE '%'||$2||'%') AND ($3='' OR $3='all' OR (CASE WHEN u.status='frozen' THEN 'frozen' WHEN ms.end_date<CURRENT_DATE AND ms.status='active' THEN 'expired' ELSE u.status END)=$3) ORDER BY u.created_at DESC LIMIT 500`,[gym(req),s,status]);res.json({members:q.rows});}catch(e){next(e);}});
-r.post('/members',auth,authorize('admin','staff'),async(req,res,next)=>{const c=await pool.connect();try{const d=z.object({full_name:z.string().min(2),phone:z.string().min(7).refine(v=>phoneValue(v).length>=10,'Enter a valid phone number'),email:z.string().email().optional().or(z.literal('')),plan_id:z.string().uuid().optional(),payment_method:z.enum(['cash','upi','bank_transfer','card','online']).default('cash'),whatsapp_opt_in:z.boolean().default(false),amount_paid:z.coerce.number().nonnegative().optional()}).parse(req.body);await c.query('BEGIN');const code=memberCode('M');const u=(await c.query(`INSERT INTO users(gym_id,member_code,full_name,email,password_hash,phone,role,status,whatsapp_opt_in,whatsapp_opt_in_at) VALUES($1,$2,$3,$4,$5,$6,'member','active',$7,CASE WHEN $7 THEN NOW() ELSE NULL END) RETURNING id,member_code,full_name,email,phone,status`,[gym(req),code,d.full_name,d.email||null,await bcrypt.hash(crypto.randomBytes(24).toString('hex'),10),phoneValue(d.phone),d.whatsapp_opt_in])).rows[0];let sub=null;if(d.plan_id){const p=await c.query('SELECT * FROM membership_plans WHERE id=$1 AND gym_id=$2 AND is_active=true',[d.plan_id,gym(req)]);if(!p.rowCount)throw Object.assign(new Error('Membership plan not found'),{status:404});const plan=p.rows[0];sub=(await c.query(`INSERT INTO member_subscriptions(gym_id,user_id,plan_id,start_date,end_date,status) VALUES($1,$2,$3,CURRENT_DATE,CURRENT_DATE+($4-1),'active') RETURNING *`,[gym(req),u.id,plan.id,plan.duration_days])).rows[0];const amount=d.amount_paid??Number(plan.price);if(amount>0)await c.query(`INSERT INTO payments(gym_id,invoice_number,user_id,subscription_id,amount,total_amount,payment_method,status,paid_at,description) VALUES($1,$2,$3,$4,$5,$5,$6,'paid',NOW(),$7)`,[gym(req),invoiceNumber(),u.id,sub.id,amount,d.payment_method,`${plan.name} membership`]);}await c.query('COMMIT');res.status(201).json({member:u,subscription:sub});}catch(e){await c.query('ROLLBACK').catch(()=>{});next(e);}finally{c.release();}});
+
+r.post('/members',auth,authorize('admin','staff'),async(req,res,next)=>{
+  const c=await pool.connect();
+  try{
+    const d=z.object({
+      full_name:z.string().min(2),
+      phone:z.string().min(7).refine(v=>phoneValue(v).length>=10,'Enter a valid phone number'),
+      email:z.string().email().optional().or(z.literal('')),
+      plan_id:z.string().uuid().optional(),
+      payment_method:z.enum(['cash','upi','bank_transfer','card','online']).default('cash'),
+      whatsapp_opt_in:z.boolean().default(false),
+      amount_paid:z.coerce.number().nonnegative().default(0)
+    }).parse(req.body);
+
+    await c.query('BEGIN');
+
+    const code=memberCode('M');
+    const u=(await c.query(`
+      INSERT INTO users(gym_id,member_code,full_name,email,password_hash,phone,role,status,whatsapp_opt_in,whatsapp_opt_in_at)
+      VALUES($1,$2,$3,$4,$5,$6,'member','active',$7,CASE WHEN $7 THEN NOW() ELSE NULL END)
+      RETURNING id,member_code,full_name,email,phone,status
+    `,[
+      gym(req),code,d.full_name,d.email||null,
+      await bcrypt.hash(crypto.randomBytes(24).toString('hex'),10),
+      phoneValue(d.phone),d.whatsapp_opt_in
+    ])).rows[0];
+
+    let sub=null;
+
+    if(d.plan_id){
+      const p=await c.query(
+        'SELECT * FROM membership_plans WHERE id=$1 AND gym_id=$2 AND is_active=true',
+        [d.plan_id,gym(req)]
+      );
+
+      if(!p.rowCount){
+        throw Object.assign(new Error('Membership plan not found'),{status:404});
+      }
+
+      const plan=p.rows[0];
+      const amountPaid=Number(d.amount_paid);
+      const price=Number(plan.price);
+
+      if(amountPaid>price){
+        throw Object.assign(new Error('Amount paid cannot exceed the membership plan price'),{status:400});
+      }
+
+      sub=(await c.query(`
+        INSERT INTO member_subscriptions(gym_id,user_id,plan_id,start_date,end_date,status)
+        VALUES($1,$2,$3,CURRENT_DATE,CURRENT_DATE+($4-1),'active')
+        RETURNING *
+      `,[gym(req),u.id,plan.id,plan.duration_days])).rows[0];
+
+      const balance=Number((price-amountPaid).toFixed(2));
+
+      if(amountPaid>0){
+        await c.query(`
+          INSERT INTO payments(gym_id,invoice_number,user_id,subscription_id,amount,total_amount,payment_method,status,paid_at,description)
+          VALUES($1,$2,$3,$4,$5,$5,$6,'paid',NOW(),$7)
+        `,[
+          gym(req),invoiceNumber(),u.id,sub.id,
+          amountPaid,d.payment_method,`Payment received — ${plan.name} membership`
+        ]);
+      }
+
+      if(balance>0){
+        await c.query(`
+          INSERT INTO payments(gym_id,invoice_number,user_id,subscription_id,amount,total_amount,payment_method,status,paid_at,description)
+          VALUES($1,$2,$3,$4,$5,$5,$6,'pending',NULL,$7)
+        `,[
+          gym(req),invoiceNumber(),u.id,sub.id,
+          balance,d.payment_method,`Outstanding balance — ${plan.name} membership`
+        ]);
+      }
+    }
+
+    await c.query('COMMIT');
+    res.status(201).json({member:u,subscription:sub});
+  }catch(e){
+    await c.query('ROLLBACK').catch(()=>{});
+    next(e);
+  }finally{
+    c.release();
+  }
+});
+
 r.get('/members/:id/payments',auth,authorize('admin','staff'),async(req,res,next)=>{try{const m=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[req.params.id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const q=await query('SELECT id,invoice_number,total_amount,payment_method,status,paid_at,created_at,description FROM payments WHERE gym_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 200',[gym(req),req.params.id]);res.json({payments:q.rows,total_paid:q.rows.filter(x=>x.status==='paid').reduce((s,x)=>s+Number(x.total_amount),0)});}catch(e){next(e);}});
 r.get('/members/:id/attendance',auth,authorize('admin','staff'),async(req,res,next)=>{try{const m=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[req.params.id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const q=await query('SELECT id,check_in_time,check_out_time,check_in_method FROM attendance_logs WHERE gym_id=$1 AND user_id=$2 ORDER BY check_in_time DESC LIMIT 100',[gym(req),req.params.id]);res.json({attendance:q.rows,total:q.rowCount});}catch(e){next(e);}});
 r.patch('/members/:id',auth,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({full_name:z.string().min(2).optional(),phone:z.string().min(7).refine(v=>phoneValue(v).length>=10,'Enter a valid phone number').optional(),email:z.string().email().optional().or(z.literal('')),status:z.enum(['active','inactive','frozen']).optional(),whatsapp_opt_in:z.boolean().optional()}).parse(req.body);const q=await query(`UPDATE users SET full_name=COALESCE($1,full_name),phone=COALESCE($2,phone),email=COALESCE(NULLIF($3,''),email),status=COALESCE($4,status),whatsapp_opt_in=COALESCE($5,whatsapp_opt_in),whatsapp_opt_in_at=CASE WHEN $5=true AND whatsapp_opt_in=false THEN NOW() WHEN $5=false THEN NULL ELSE whatsapp_opt_in_at END WHERE id=$6 AND gym_id=$7 AND role='member' RETURNING id,member_code,full_name,email,phone,status`,[d.full_name,d.phone?phoneValue(d.phone):null,d.email,d.status,d.whatsapp_opt_in,req.params.id,gym(req)]);if(!q.rowCount)return res.status(404).json({message:'Member not found'});res.json({member:q.rows[0]});}catch(e){next(e);}});
