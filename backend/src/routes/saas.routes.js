@@ -219,7 +219,7 @@ r.post('/members/:id/subscriptions',auth,authorize('admin','staff'),async(req,re
   }finally{
     c.release();
   }
-}});
+});
 
 
 
