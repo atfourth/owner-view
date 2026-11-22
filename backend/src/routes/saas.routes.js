@@ -1,3 +1,4 @@
+```javascript
 import {Router} from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -398,7 +399,7 @@ r.get('/me',auth,async(req,res,next)=>{
         g.name gym_name,g.slug gym_slug
       FROM users u
       JOIN gyms g ON g.id=u.gym_id
-      WHERE u.id=$1 AND u.gym_id=$2
+            WHERE u.id=$1 AND u.gym_id=$2
     `,[req.user.id,gym(req)]);
 
     if(!q.rowCount)
@@ -798,7 +799,7 @@ r.get('/plans',auth,async(req,res,next)=>{
             WHERE ms.gym_id=mp.gym_id
               AND ms.plan_id=mp.id
               AND ms.status='active'
-              AND ms.end_date>=CURRENT_DATE
+                            AND ms.end_date>=CURRENT_DATE
           ) active_subscribers
         FROM membership_plans mp
         WHERE mp.gym_id=$1
@@ -859,6 +860,90 @@ r.patch('/plans/:id',auth,admin,async(req,res,next)=>{
 
     if(!q.rowCount)return res.status(404).json({message:'Plan not found'});
     res.json({plan:q.rows[0]});
+  }catch(e){next(e);}
+});
+
+// Create a member and, when selected, their first membership.
+r.post('/members',auth,authorize('admin','staff'),async(req,res,next)=>{
+  const c=await pool.connect();
+  try{
+    const d=z.object({
+      full_name:z.string().trim().min(2).max(160),
+      email:z.string().trim().email().optional().or(z.literal('')),
+      phone:z.string().trim().min(7).max(30),
+      plan_id:z.string().uuid().optional().or(z.literal('')),
+      amount_paid:z.coerce.number().nonnegative().default(0),
+      payment_method:z.enum(['cash','upi','bank_transfer','card','online']).default('cash'),
+      whatsapp_opt_in:z.boolean().default(false)
+    }).parse(req.body);
+    await c.query('BEGIN');
+    const email=d.email?d.email.toLowerCase():null;
+    if(email){
+      const duplicate=await c.query(
+        'SELECT id FROM users WHERE gym_id=$1 AND lower(email)=lower($2) AND role=\'member\'',
+        [gym(req),email]
+      );
+      if(duplicate.rowCount)throw Object.assign(new Error('A member with this email already exists'),{status:409});
+    }
+    const duplicatePhone=await c.query(
+      'SELECT id FROM users WHERE gym_id=$1 AND phone=$2 AND role=\'member\'',
+      [gym(req),phoneValue(d.phone)]
+    );
+    if(duplicatePhone.rowCount)throw Object.assign(new Error('A member with this phone number already exists'),{status:409});
+
+    let plan=null;
+    if(d.plan_id){
+      const p=await c.query('SELECT * FROM membership_plans WHERE id=$1 AND gym_id=$2 AND is_active=true',[d.plan_id,gym(req)]);
+      if(!p.rowCount)throw Object.assign(new Error('Selected membership plan not found'),{status:404});
+      plan=p.rows[0];
+      if(d.amount_paid>Number(plan.price))throw Object.assign(new Error('Amount paid cannot exceed the plan price'),{status:400});
+    }else if(d.amount_paid>0){
+      throw Object.assign(new Error('Select a membership plan before recording an amount paid'),{status:400});
+    }
+
+    const tempPassword=crypto.randomBytes(24).toString('hex');
+    const member=(await c.query(`
+      INSERT INTO users(gym_id,member_code,full_name,email,password_hash,phone,role,status,whatsapp_opt_in)
+      VALUES($1,$2,$3,$4,$5,$6,'member','active',$7)
+      RETURNING id,member_code,full_name,email,phone,role,status,whatsapp_opt_in,created_at
+    `,[gym(req),memberCode(),d.full_name,email,await bcrypt.hash(tempPassword,12),phoneValue(d.phone),d.whatsapp_opt_in])).rows[0];
+
+    let subscription=null;
+    if(plan){
+      subscription=(await c.query(`
+        INSERT INTO member_subscriptions(gym_id,user_id,plan_id,start_date,end_date,status,total_amount)
+        VALUES($1,$2,$3,CURRENT_DATE,CURRENT_DATE+($4-1),'active',$5) RETURNING *
+      `,[gym(req),member.id,plan.id,plan.duration_days,plan.price])).rows[0];
+      if(d.amount_paid>0){
+        await c.query(`
+          INSERT INTO payments(gym_id,invoice_number,user_id,subscription_id,amount,total_amount,payment_method,status,paid_at,description,entry_type,recorded_by)
+          VALUES($1,$2,$3,$4,$5,$5,$6,'paid',NOW(),$7,'payment',$8)
+        `,[gym(req),invoiceNumber(),member.id,subscription.id,d.amount_paid,d.payment_method,`${plan.name} membership payment`,req.user.id]);
+      }
+    }
+    await c.query('COMMIT');
+    res.status(201).json({member,subscription,total_amount:plan?Number(plan.price):0,amount_paid:d.amount_paid,pending_amount:plan?Number(plan.price)-d.amount_paid:0});
+  }catch(e){await c.query('ROLLBACK').catch(()=>{});next(e);}
+  finally{c.release();}
+});
+
+// Update basic member details, scoped to the authenticated gym.
+r.patch('/members/:id',auth,authorize('admin','staff'),async(req,res,next)=>{
+  try{
+    const d=z.object({
+      full_name:z.string().trim().min(2).max(160).optional(),
+      email:z.string().trim().email().nullable().optional(),
+      phone:z.string().trim().min(7).max(30).optional(),
+      whatsapp_opt_in:z.boolean().optional()
+    }).parse(req.body);
+    if(!Object.keys(d).length)return res.status(400).json({message:'No updates supplied'});
+    if(d.email)d.email=d.email.toLowerCase();
+    if(d.phone)d.phone=phoneValue(d.phone);
+    const keys=Object.keys(d),values=keys.map(k=>d[k]);
+    const sets=keys.map((k,i)=>`${k}=$${i+1}`).join(',');
+    const q=await query(`UPDATE users SET ${sets},updated_at=NOW() WHERE id=$${keys.length+1} AND gym_id=$${keys.length+2} AND role='member' RETURNING id,member_code,full_name,email,phone,status,whatsapp_opt_in`,[...values,req.params.id,gym(req)]);
+    if(!q.rowCount)return res.status(404).json({message:'Member not found'});
+    res.json({member:q.rows[0]});
   }catch(e){next(e);}
 });
 
@@ -1114,7 +1199,7 @@ r.post('/attendance/check-in',auth,authorize('admin','staff'),async(req,res,next
     `,[gym(req),m.rows[0].id]);
 
     if(existing.rowCount)
-      return res.status(409).json({message:'Member is already checked in'});
+            return res.status(409).json({message:'Member is already checked in'});
 
     const q=await query(`
       INSERT INTO attendance_logs(
@@ -1150,8 +1235,35 @@ r.patch('/attendance/:id/check-out',auth,authorize('admin','staff'),async(req,re
   }catch(e){next(e);}
 });
 
+// Attendance history for one member.
+r.get('/members/:id/attendance',auth,async(req,res,next)=>{
+  try{
+    const member=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[req.params.id,gym(req)]);
+    if(!member.rowCount)return res.status(404).json({message:'Member not found'});
+    const q=await query(`SELECT * FROM attendance_logs WHERE gym_id=$1 AND user_id=$2 ORDER BY attendance_date DESC,check_in_time DESC LIMIT 200`,[gym(req),req.params.id]);
+    res.json({logs:q.rows,attendance:q.rows});
+  }catch(e){next(e);}
+});
+
 // Payment records and Razorpay checkout.
 const paymentAccess=[auth,moduleGate('payments')];
+
+// Payment history for one member, including the staff member who recorded it.
+r.get('/members/:id/payments',...paymentAccess,async(req,res,next)=>{
+  try{
+    const member=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[req.params.id,gym(req)]);
+    if(!member.rowCount)return res.status(404).json({message:'Member not found'});
+    const q=await query(`
+      SELECT p.*,u.full_name recorded_by_name
+      FROM payments p
+      LEFT JOIN users u ON u.id=p.recorded_by AND u.gym_id=p.gym_id
+      WHERE p.gym_id=$1 AND p.user_id=$2
+      ORDER BY COALESCE(p.paid_at,p.created_at) DESC,p.created_at DESC
+      LIMIT 200
+    `,[gym(req),req.params.id]);
+    res.json({payments:q.rows});
+  }catch(e){next(e);}
+});
 
 // Only actual payment transactions appear in the Payments page.
 // Balance placeholders are not transactions received from a member.
@@ -1487,7 +1599,7 @@ r.post('/payments/link',...paymentAccess,authorize('admin','staff'),async(req,re
         );
 
         await logNotification(
-          gym(req),member.rows[0].phone,
+                    gym(req),member.rows[0].phone,
           'payment_link',p.id,'sent',null,messageId
         );
 
@@ -1887,8 +1999,7 @@ r.post('/public/:slug/verify-checkin',async(req,res,next)=>{
       "SELECT id FROM gyms WHERE slug=$1 AND status='active'",
       [req.params.slug]
     );
-
-    if(!g.rowCount)
+        if(!g.rowCount)
       return res.status(404).json({message:'Gym not found'});
 
     const gymId=g.rows[0].id;
