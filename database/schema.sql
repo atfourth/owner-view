@@ -282,3 +282,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gym_invoice ON payments(gym_id,invoice_num
 INSERT INTO gym_modules(gym_id,module_key,enabled)
 SELECT g.id,m.key,m.enabled FROM gyms g CROSS JOIN (VALUES ('members',true),('memberships',true),('attendance',true),('payments',true),('finance',true),('trials',true),('trainers',true),('classes',false),('equipment',false),('whatsapp',false),('online_payments',false)) m(key,enabled)
 ON CONFLICT DO NOTHING;
+
+-- 005_membership_payment_accounting.sql
+ALTER TABLE member_subscriptions ADD COLUMN IF NOT EXISTS total_amount NUMERIC(10,2) NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'member_subscriptions_total_amount_check'
+    ) THEN
+        ALTER TABLE member_subscriptions ADD CONSTRAINT member_subscriptions_total_amount_check CHECK (total_amount >= 0);
+    END IF;
+END $$;
+
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS entry_type VARCHAR(20) NOT NULL DEFAULT 'payment';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'payments_entry_type_check'
+    ) THEN
+        ALTER TABLE payments ADD CONSTRAINT payments_entry_type_check CHECK (entry_type IN ('payment', 'balance'));
+    END IF;
+END $$;
+
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS recorded_by UUID REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_payments_subscription_type ON payments(subscription_id, entry_type, status);

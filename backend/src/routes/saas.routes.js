@@ -1,4 +1,3 @@
-```javascript
 import {Router} from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -1725,6 +1724,133 @@ r.patch('/payments/:id/mark-paid',...paymentAccess,authorize('admin','staff'),as
     await c.query('ROLLBACK').catch(()=>{});
     next(e);
   }finally{c.release();}
+});
+
+// Record a partial payment against an existing pending invoice.
+// Preserves original membership price, creates an immutable payment record,
+// never creates duplicate memberships, prevents payment above outstanding balance,
+// and ensures gym data isolation.
+r.post('/payments/:id/partial',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{
+  const c=await pool.connect();
+  try{
+    const d=z.object({
+      amount:z.coerce.number().positive(),
+      payment_method:z.enum(['cash','upi','bank_transfer','card','online'])
+    }).parse(req.body);
+
+    await c.query('BEGIN');
+
+    // 1. Lock and retrieve the pending invoice scoped to the authenticated gym
+    const q=await c.query(
+      `SELECT * FROM payments
+       WHERE id=$1 AND gym_id=$2 AND status='pending' AND entry_type='payment'
+       FOR UPDATE`,
+      [req.params.id,gym(req)]
+    );
+
+    if(!q.rowCount){
+      await c.query('ROLLBACK');
+      return res.status(404).json({message:'Pending payment not found'});
+    }
+
+    const invoice=q.rows[0];
+    const invoiceOutstanding=Number(invoice.total_amount);
+
+    if(d.amount>invoiceOutstanding){
+      await c.query('ROLLBACK');
+      return res.status(400).json({
+        message:`Amount cannot exceed pending invoice balance of ₹${invoiceOutstanding.toFixed(2)}`
+      });
+    }
+
+    // 2. If tied to a membership subscription, lock and verify against overall subscription balance
+    if(invoice.subscription_id){
+      const sub=await c.query(
+        `SELECT id,total_amount FROM member_subscriptions
+         WHERE id=$1 AND gym_id=$2
+         FOR UPDATE`,
+        [invoice.subscription_id,gym(req)]
+      );
+
+      if(!sub.rowCount){
+        await c.query('ROLLBACK');
+        return res.status(404).json({message:'Membership not found'});
+      }
+
+      const paid=await c.query(
+        `SELECT COALESCE(SUM(total_amount),0) total_paid
+         FROM payments
+         WHERE gym_id=$1 AND subscription_id=$2 AND entry_type='payment' AND status='paid'`,
+        [gym(req),invoice.subscription_id]
+      );
+
+      const maxRemaining=Math.max(0,Number(sub.rows[0].total_amount)-Number(paid.rows[0].total_paid));
+      if(d.amount>maxRemaining){
+        await c.query('ROLLBACK');
+        return res.status(400).json({
+          message:`Amount exceeds remaining membership balance of ₹${maxRemaining.toFixed(2)}`
+        });
+      }
+    }
+
+    const remaining=Number((invoiceOutstanding-d.amount).toFixed(2));
+
+    // 3. Insert immutable receipt for the actual received payment transaction
+    const received=await c.query(
+      `INSERT INTO payments(
+        gym_id,invoice_number,user_id,subscription_id,trial_visitor_id,
+        amount,total_amount,payment_method,status,paid_at,
+        description,entry_type,recorded_by
+      )
+      VALUES($1,$2,$3,$4,$5,$6,$6,$7,'paid',NOW(),$8,'payment',$9)
+      RETURNING *`,
+      [
+        gym(req),
+        invoiceNumber(),
+        invoice.user_id,
+        invoice.subscription_id,
+        invoice.trial_visitor_id,
+        d.amount,
+        d.payment_method,
+        `Partial payment against invoice ${invoice.invoice_number}`,
+        req.user.id
+      ]
+    );
+
+    // 4. Update the pending invoice balance; if fully satisfied (remaining === 0), mark as paid
+    const updated=await c.query(
+      `UPDATE payments
+       SET amount=$1,
+           total_amount=$1,
+           status=CASE WHEN $1=0 THEN 'paid' ELSE 'pending' END,
+           paid_at=CASE WHEN $1=0 THEN NOW() ELSE NULL END,
+           recorded_by=CASE WHEN $1=0 THEN $4 ELSE recorded_by END
+       WHERE id=$2 AND gym_id=$3 AND status='pending'
+       RETURNING *`,
+      [remaining,invoice.id,gym(req),req.user.id]
+    );
+
+    // 5. If this invoice had an associated Razorpay order and is now fully settled, mark payment_orders paid
+    if(remaining===0){
+      await c.query(
+        `UPDATE payment_orders SET status='paid' WHERE payment_id=$1 AND gym_id=$2`,
+        [invoice.id,gym(req)]
+      );
+    }
+
+    await c.query('COMMIT');
+
+    res.status(201).json({
+      message:remaining===0?'Payment completed successfully':'Partial payment recorded successfully',
+      payment:received.rows[0],
+      outstanding:updated.rows[0]
+    });
+  }catch(e){
+    await c.query('ROLLBACK').catch(()=>{});
+    next(e);
+  }finally{
+    c.release();
+  }
 });
 
 // Razorpay webhook.
