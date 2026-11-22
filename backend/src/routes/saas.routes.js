@@ -20,8 +20,169 @@ function moduleGate(key){return async(req,res,next)=>{try{const q=await query('S
 async function integration(g,provider){const q=await query('SELECT config_encrypted,enabled FROM gym_integrations WHERE gym_id=$1 AND provider=$2',[g,provider]);return q.rowCount&&q.rows[0].enabled?decrypt(q.rows[0].config_encrypted):null;}
 async function sendWhatsApp(g,phone,template,params=[]){const cfg=await integration(g,'whatsapp');if(!cfg)throw new Error('WhatsApp is not configured for this gym');const digits=phoneValue(phone);const body={messaging_product:'whatsapp',to:digits,type:'template',template:{name:template,language:{code:cfg.language||'en'},components:params.length?[{type:'body',parameters:params.map(text=>({type:'text',text:String(text)}))}]:[]}};const response=await fetch(`https://graph.facebook.com/${cfg.apiVersion||'v22.0'}/${cfg.phoneNumberId}/messages`,{method:'POST',headers:{Authorization:`Bearer ${cfg.accessToken}`,'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw new Error(data.error?.message||'WhatsApp provider error');return data.messages?.[0]?.id||null;}
 async function logNotification(g,phone,kind,id,status,error=null,providerId=null){await query(`INSERT INTO notification_logs(gym_id,recipient,kind,reference_id,status,error,provider_message_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(gym_id,kind,reference_id) DO UPDATE SET status=EXCLUDED.status,error=EXCLUDED.error,provider_message_id=EXCLUDED.provider_message_id,sent_at=NOW()`,[g,phone,kind,id,status,error,providerId]);}
-async function reconcilePayment(g,providerOrderId){const c=await pool.connect();try{await c.query('BEGIN');const q=await c.query(`SELECT po.id order_row_id,po.payment_id,po.status order_status,p.trial_visitor_id,p.subscription_id,p.user_id FROM payment_orders po JOIN payments p ON p.id=po.payment_id AND p.gym_id=po.gym_id WHERE po.gym_id=$1 AND po.provider_order_id=$2 FOR UPDATE`,[g,providerOrderId]);if(!q.rowCount){await c.query('COMMIT');return;}const row=q.rows[0];if(row.order_status==='paid'){await c.query('COMMIT');return;}await c.query("UPDATE payments SET status='paid',paid_at=NOW() WHERE id=$1 AND gym_id=$2",[row.payment_id,g]);await c.query("UPDATE payment_orders SET status='paid' WHERE id=$1",[row.order_row_id]);if(row.trial_visitor_id){const t=await c.query('SELECT * FROM trial_visitors WHERE id=$1 AND gym_id=$2 FOR UPDATE',[row.trial_visitor_id,g]);if(t.rowCount&&t.rows[0].status!=='converted'&&t.rows[0].interested_plan_id){const trial=t.rows[0];let member=await c.query("SELECT id FROM users WHERE gym_id=$1 AND phone=$2 AND role='member'",[g,trial.phone]);if(!member.rowCount){member=await c.query(`INSERT INTO users(gym_id,member_code,full_name,email,password_hash,phone,role,status,whatsapp_opt_in,whatsapp_opt_in_at) VALUES($1,$2,$3,$4,$5,$6,'member','active',$7,CASE WHEN $7 THEN NOW() ELSE NULL END) RETURNING id`,[g,memberCode('M'),trial.full_name,trial.email,await bcrypt.hash(crypto.randomBytes(24).toString('hex'),10),trial.phone,trial.whatsapp_opt_in]);}if(trial.whatsapp_opt_in)await c.query('UPDATE users SET whatsapp_opt_in=true,whatsapp_opt_in_at=COALESCE(whatsapp_opt_in_at,NOW()) WHERE id=$1 AND gym_id=$2',[member.rows[0].id,g]);const plan=await c.query('SELECT duration_days FROM membership_plans WHERE id=$1 AND gym_id=$2',[trial.interested_plan_id,g]);if(plan.rowCount){await c.query("UPDATE member_subscriptions SET status='expired' WHERE gym_id=$1 AND user_id=$2 AND status='active'",[g,member.rows[0].id]);await c.query("UPDATE users SET status='active' WHERE id=$1 AND gym_id=$2",[member.rows[0].id,g]);const sub=(await c.query(`INSERT INTO member_subscriptions(gym_id,user_id,plan_id,start_date,end_date,status) VALUES($1,$2,$3,CURRENT_DATE,CURRENT_DATE+($4-1),'active') RETURNING id`,[g,member.rows[0].id,trial.interested_plan_id,plan.rows[0].duration_days])).rows[0];await c.query("UPDATE payments SET user_id=$1,subscription_id=$2 WHERE id=$3 AND gym_id=$4",[member.rows[0].id,sub.id,row.payment_id,g]);await c.query("UPDATE trial_visitors SET status='converted',converted_member_id=$1 WHERE id=$2 AND gym_id=$3",[member.rows[0].id,trial.id,g]);}}}else if(row.subscription_id&&row.user_id){const current=await c.query(`SELECT ms.*,mp.duration_days FROM member_subscriptions ms JOIN membership_plans mp ON mp.id=ms.plan_id AND mp.gym_id=ms.gym_id WHERE ms.id=$1 AND ms.gym_id=$2 AND ms.user_id=$3 AND ms.status='active'`,[row.subscription_id,g,row.user_id]);if(current.rowCount){const old=current.rows[0];const other=await c.query("SELECT 1 FROM member_subscriptions WHERE gym_id=$1 AND user_id=$2 AND status='active' AND id<>$3 LIMIT 1",[g,row.user_id,old.id]);if(other.rowCount){await c.query('COMMIT');return;}const start=(await c.query('SELECT GREATEST(CURRENT_DATE,$1::date+1) start_date',[old.end_date])).rows[0].start_date;await c.query("UPDATE member_subscriptions SET status='expired' WHERE id=$1 AND gym_id=$2",[old.id,g]);const next=(await c.query(`INSERT INTO member_subscriptions(gym_id,user_id,plan_id,start_date,end_date,status) VALUES($1,$2,$3,$4::date,$4::date+($5-1),'active') RETURNING id`,[g,row.user_id,old.plan_id,start,old.duration_days])).rows[0];await c.query("UPDATE users SET status='active' WHERE id=$1 AND gym_id=$2",[row.user_id,g]);await c.query("UPDATE payments SET subscription_id=$1 WHERE id=$2 AND gym_id=$3",[next.id,row.payment_id,g]);}}await c.query('COMMIT');}catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}}
 
+async function reconcilePayment(g,providerOrderId){
+  const c=await pool.connect();
+
+  try{
+    await c.query('BEGIN');
+
+    const q=await c.query(`
+      SELECT
+        po.id order_row_id,
+        po.payment_id,
+        po.status order_status,
+        p.trial_visitor_id,
+        p.subscription_id,
+        p.user_id
+      FROM payment_orders po
+      JOIN payments p
+        ON p.id=po.payment_id
+        AND p.gym_id=po.gym_id
+      WHERE po.gym_id=$1
+        AND po.provider_order_id=$2
+      FOR UPDATE
+    `,[g,providerOrderId]);
+
+    if(!q.rowCount){
+      await c.query('COMMIT');
+      return;
+    }
+
+    const row=q.rows[0];
+
+    if(row.order_status==='paid'){
+      await c.query('COMMIT');
+      return;
+    }
+
+    await c.query(`
+      UPDATE payments
+      SET status='paid',paid_at=NOW()
+      WHERE id=$1 AND gym_id=$2
+    `,[row.payment_id,g]);
+
+    await c.query(`
+      UPDATE payment_orders
+      SET status='paid'
+      WHERE id=$1
+    `,[row.order_row_id]);
+
+    // Convert a paid trial visitor into a member.
+    if(row.trial_visitor_id){
+      const t=await c.query(`
+        SELECT *
+        FROM trial_visitors
+        WHERE id=$1 AND gym_id=$2
+        FOR UPDATE
+      `,[row.trial_visitor_id,g]);
+
+      if(
+        t.rowCount &&
+        t.rows[0].status!=='converted' &&
+        t.rows[0].interested_plan_id
+      ){
+        const trial=t.rows[0];
+
+        let member=await c.query(`
+          SELECT id
+          FROM users
+          WHERE gym_id=$1 AND phone=$2 AND role='member'
+        `,[g,trial.phone]);
+
+        if(!member.rowCount){
+          member=await c.query(`
+            INSERT INTO users(
+              gym_id,member_code,full_name,email,password_hash,
+              phone,role,status,whatsapp_opt_in,whatsapp_opt_in_at
+            )
+            VALUES($1,$2,$3,$4,$5,$6,'member','active',$7,
+              CASE WHEN $7 THEN NOW() ELSE NULL END)
+            RETURNING id
+          `,[
+            g,
+            memberCode('M'),
+            trial.full_name,
+            trial.email,
+            await bcrypt.hash(crypto.randomBytes(24).toString('hex'),10),
+            trial.phone,
+            trial.whatsapp_opt_in
+          ]);
+        }
+
+        const memberId=member.rows[0].id;
+
+        if(trial.whatsapp_opt_in){
+          await c.query(`
+            UPDATE users
+            SET whatsapp_opt_in=true,
+                whatsapp_opt_in_at=COALESCE(whatsapp_opt_in_at,NOW())
+            WHERE id=$1 AND gym_id=$2
+          `,[memberId,g]);
+        }
+
+        const plan=await c.query(`
+          SELECT duration_days,price
+          FROM membership_plans
+          WHERE id=$1 AND gym_id=$2
+        `,[trial.interested_plan_id,g]);
+
+        if(plan.rowCount){
+          await c.query(`
+            UPDATE member_subscriptions
+            SET status='expired'
+            WHERE gym_id=$1 AND user_id=$2 AND status='active'
+          `,[g,memberId]);
+
+          await c.query(`
+            UPDATE users SET status='active'
+            WHERE id=$1 AND gym_id=$2
+          `,[memberId,g]);
+
+          const sub=(await c.query(`
+            INSERT INTO member_subscriptions(
+              gym_id,user_id,plan_id,start_date,end_date,
+              status,total_amount
+            )
+            VALUES(
+              $1,$2,$3,CURRENT_DATE,
+              CURRENT_DATE+($4-1),'active',$5
+            )
+            RETURNING id
+          `,[
+            g,
+            memberId,
+            trial.interested_plan_id,
+            plan.rows[0].duration_days,
+            plan.rows[0].price
+          ])).rows[0];
+
+          await c.query(`
+            UPDATE payments
+            SET user_id=$1,subscription_id=$2
+            WHERE id=$3 AND gym_id=$4
+          `,[memberId,sub.id,row.payment_id,g]);
+
+          await c.query(`
+            UPDATE trial_visitors
+            SET status='converted',converted_member_id=$1
+            WHERE id=$2 AND gym_id=$3
+          `,[memberId,trial.id,g]);
+        }
+      }
+    }
+
+    // Existing member payments only settle the linked payment.
+    // They must never create or renew a membership.
+    await c.query('COMMIT');
+
+  }catch(e){
+    await c.query('ROLLBACK').catch(()=>{});
+    throw e;
+  }finally{
+    c.release();
+  }
+}
 // Enforce owner-selected modules at the API boundary, not just in navigation.
 r.use('/members',auth,moduleGate('members'));
 r.use('/plans',auth,moduleGate('memberships'));
