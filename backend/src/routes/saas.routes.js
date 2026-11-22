@@ -40,13 +40,15 @@ function phoneValue(v){
 }
 
 
+
 function invoiceNumber(){
-  return `INV-${Date.now()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+  return 'INV-'+Date.now()+'-'+crypto.randomBytes(2).toString('hex').toUpperCase();
 }
 
 function memberCode(prefix='M'){
-  return `${prefix}-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  return prefix+'-'+Date.now().toString(36).toUpperCase()+'-'+crypto.randomBytes(3).toString('hex').toUpperCase();
 }
+
 
 function slugify(s){
   return s.toLowerCase().normalize('NFKD')
