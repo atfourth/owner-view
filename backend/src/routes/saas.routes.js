@@ -231,100 +231,100 @@ r.patch('/attendance/:id/check-out',auth,authorize('admin','staff'),async(req,re
 // Payment records and Razorpay checkout
 const paymentAccess=[auth,moduleGate('payments')];
 r.get('/payments',...paymentAccess,async(req,res,next)=>{try{const q=await query(`SELECT p.*,COALESCE(u.full_name,tv.full_name) full_name,COALESCE(u.member_code,'TRIAL') member_code FROM payments p LEFT JOIN users u ON u.id=p.user_id AND u.gym_id=p.gym_id LEFT JOIN trial_visitors tv ON tv.id=p.trial_visitor_id AND tv.gym_id=p.gym_id WHERE p.gym_id=$1 ORDER BY p.created_at DESC LIMIT 500`,[gym(req)]);res.json({payments:q.rows});}catch(e){next(e);}});
-r.post('/payments',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({member_id:z.string().uuid(),amount:z.coerce.number().positive(),payment_method:z.enum(['cash','upi','bank_transfer','card','online']),status:z.enum(['paid','pending']).default('paid'),description:z.string().optional()}).parse(req.body);const m=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[d.member_id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const q=await query(
-  `INSERT INTO payments(
-    gym_id,invoice_number,user_id,amount,total_amount,
-    payment_method,status,paid_at,description
-  )
-  VALUES(
-    $1,$2,$3,$4,$4,$5,$6::varchar,
-    CASE WHEN $6::varchar='paid' THEN NOW() ELSE NULL END,
-    $7
-  )
-  RETURNING *`,
-  [
-    gym(req),
-    invoiceNumber(),
-    d.member_id,
-    d.amount,
-    d.payment_method,
-    d.status,
-    d.description||'Membership payment'
-  ]
-);res.status(201).json({payment:q.rows[0]});}catch(e){next(e);}});
-r.patch('/payments/:id/mark-paid',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({payment_method:z.enum(['cash','upi','bank_transfer','card','online']).default('cash')}).parse(req.body);const q=await query("UPDATE payments SET status='paid',payment_method=$1,paid_at=NOW() WHERE id=$2 AND gym_id=$3 AND status='pending' RETURNING *",[d.payment_method,req.params.id,gym(req)]);if(!q.rowCount)return res.status(404).json({message:'Pending payment not found'});res.json({payment:q.rows[0]});}catch(e){next(e);}});
-r.post('/payments/:id/partial',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{
+
+r.post('/payments',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{
   const c=await pool.connect();
+
   try{
     const d=z.object({
+      member_id:z.string().uuid(),
       amount:z.coerce.number().positive(),
-      payment_method:z.enum(['cash','upi','bank_transfer','card','online'])
+      payment_method:z.enum(['cash','upi','bank_transfer','card','online']),
+      status:z.enum(['paid','pending']).default('paid'),
+      description:z.string().optional()
     }).parse(req.body);
 
     await c.query('BEGIN');
 
-    const q=await c.query(
-      `SELECT * FROM payments
-       WHERE id=$1 AND gym_id=$2 AND status='pending'
-       FOR UPDATE`,
-      [req.params.id,gym(req)]
+    const member=await c.query(
+      "SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",
+      [d.member_id,gym(req)]
     );
 
-    if(!q.rowCount){
-      await c.query('ROLLBACK');
-      return res.status(404).json({message:'Pending payment not found'});
-    }
+    if(!member.rowCount)
+      throw Object.assign(new Error('Member not found'),{status:404});
 
-    const invoice=q.rows[0];
-    const outstanding=Number(invoice.total_amount);
+    // Lock the latest membership to prevent simultaneous overpayments.
+    const sub=await c.query(`
+      SELECT id,total_amount
+      FROM member_subscriptions
+      WHERE gym_id=$1 AND user_id=$2
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE
+    `,[gym(req),d.member_id]);
 
-    if(d.amount>outstanding){
-      await c.query('ROLLBACK');
-      return res.status(400).json({
-        message:`Amount cannot exceed outstanding balance of ₹${outstanding.toFixed(2)}`
-      });
-    }
+    if(!sub.rowCount)
+      throw Object.assign(new Error('This member has no membership'),{status:400});
 
-    const remaining=Number((outstanding-d.amount).toFixed(2));
+    const subscription=sub.rows[0];
 
-    const received=await c.query(
-      `INSERT INTO payments(
+    const paid=await c.query(`
+      SELECT COALESCE(SUM(total_amount),0) AS total_paid
+      FROM payments
+      WHERE gym_id=$1
+        AND user_id=$2
+        AND subscription_id=$3
+        AND entry_type='payment'
+        AND status='paid'
+    `,[gym(req),d.member_id,subscription.id]);
+
+    const total=Number(subscription.total_amount);
+    const received=Number(paid.rows[0].total_paid);
+    const outstanding=Math.max(0,total-received);
+
+    if(outstanding<=0)
+      throw Object.assign(new Error('This membership is already fully paid'),{status:400});
+
+    if(d.amount>outstanding)
+      throw Object.assign(
+        new Error(`Amount cannot exceed the outstanding balance of ₹${outstanding.toFixed(2)}`),
+        {status:400}
+      );
+
+    const payment=await c.query(`
+      INSERT INTO payments(
         gym_id,invoice_number,user_id,subscription_id,
-        trial_visitor_id,amount,total_amount,payment_method,
-        status,paid_at,description
+        amount,total_amount,payment_method,status,paid_at,
+        description,entry_type,recorded_by
       )
-      VALUES($1,$2,$3,$4,$5,$6,$6,$7,'paid',NOW(),$8)
-      RETURNING *`,
-      [
-        gym(req),
-        invoiceNumber(),
-        invoice.user_id,
-        invoice.subscription_id,
-        invoice.trial_visitor_id,
-        d.amount,
-        d.payment_method,
-        `Partial payment against invoice ${invoice.invoice_number}`
-      ]
-    );
-
-const updated=await c.query(
-  `UPDATE payments
-   SET amount=$1,
-       total_amount=$1,
-       status=CASE WHEN $1=0 THEN 'paid' ELSE 'pending' END,
-       paid_at=CASE WHEN $1=0 THEN NOW() ELSE NULL END
-   WHERE id=$2 AND gym_id=$3 AND status='pending'
-   RETURNING *`,
-  [remaining,invoice.id,gym(req)]
-);
+      VALUES(
+        $1,$2,$3,$4,$5,$5,$6,$7,
+        CASE WHEN $7='paid' THEN NOW() ELSE NULL END,
+        $8,'payment',$9
+      )
+      RETURNING *
+    `,[
+      gym(req),
+      invoiceNumber(),
+      d.member_id,
+      subscription.id,
+      d.amount,
+      d.payment_method,
+      d.status,
+      d.description||'Membership payment',
+      req.user.id
+    ]);
 
     await c.query('COMMIT');
 
     res.status(201).json({
-      message:remaining===0?'Payment completed successfully':'Partial payment recorded successfully',
-      payment:received.rows[0],
-      outstanding:updated.rows[0]
+      payment:payment.rows[0],
+      total_amount:total,
+      total_paid:received+(d.status==='paid'?d.amount:0),
+      pending_amount:Math.max(0,outstanding-(d.status==='paid'?d.amount:0))
     });
+
   }catch(e){
     await c.query('ROLLBACK').catch(()=>{});
     next(e);
