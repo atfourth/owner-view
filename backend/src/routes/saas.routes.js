@@ -158,7 +158,27 @@ r.patch('/attendance/:id/check-out',auth,authorize('admin','staff'),async(req,re
 // Payment records and Razorpay checkout
 const paymentAccess=[auth,moduleGate('payments')];
 r.get('/payments',...paymentAccess,async(req,res,next)=>{try{const q=await query(`SELECT p.*,COALESCE(u.full_name,tv.full_name) full_name,COALESCE(u.member_code,'TRIAL') member_code FROM payments p LEFT JOIN users u ON u.id=p.user_id AND u.gym_id=p.gym_id LEFT JOIN trial_visitors tv ON tv.id=p.trial_visitor_id AND tv.gym_id=p.gym_id WHERE p.gym_id=$1 ORDER BY p.created_at DESC LIMIT 500`,[gym(req)]);res.json({payments:q.rows});}catch(e){next(e);}});
-r.post('/payments',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({member_id:z.string().uuid(),amount:z.coerce.number().positive(),payment_method:z.enum(['cash','upi','bank_transfer','card','online']),status:z.enum(['paid','pending']).default('paid'),description:z.string().optional()}).parse(req.body);const m=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[d.member_id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const q=await query(`INSERT INTO payments(gym_id,invoice_number,user_id,amount,total_amount,payment_method,status,paid_at,description) VALUES($1,$2,$3,$4,$4,$5,$6,CASE WHEN $6='paid' THEN NOW() ELSE NULL END,$7) RETURNING *`,[gym(req),invoiceNumber(),d.member_id,d.amount,d.payment_method,d.status,d.description||'Membership payment']);res.status(201).json({payment:q.rows[0]});}catch(e){next(e);}});
+r.post('/payments',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({member_id:z.string().uuid(),amount:z.coerce.number().positive(),payment_method:z.enum(['cash','upi','bank_transfer','card','online']),status:z.enum(['paid','pending']).default('paid'),description:z.string().optional()}).parse(req.body);const m=await query("SELECT id FROM users WHERE id=$1 AND gym_id=$2 AND role='member'",[d.member_id,gym(req)]);if(!m.rowCount)return res.status(404).json({message:'Member not found'});const q=await query(
+  `INSERT INTO payments(
+    gym_id,invoice_number,user_id,amount,total_amount,
+    payment_method,status,paid_at,description
+  )
+  VALUES(
+    $1,$2,$3,$4,$4,$5,$6::varchar,
+    CASE WHEN $6::varchar='paid' THEN NOW() ELSE NULL END,
+    $7
+  )
+  RETURNING *`,
+  [
+    gym(req),
+    invoiceNumber(),
+    d.member_id,
+    d.amount,
+    d.payment_method,
+    d.status,
+    d.description||'Membership payment'
+  ]
+);res.status(201).json({payment:q.rows[0]});}catch(e){next(e);}});
 r.patch('/payments/:id/mark-paid',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{try{const d=z.object({payment_method:z.enum(['cash','upi','bank_transfer','card','online']).default('cash')}).parse(req.body);const q=await query("UPDATE payments SET status='paid',payment_method=$1,paid_at=NOW() WHERE id=$2 AND gym_id=$3 AND status='pending' RETURNING *",[d.payment_method,req.params.id,gym(req)]);if(!q.rowCount)return res.status(404).json({message:'Pending payment not found'});res.json({payment:q.rows[0]});}catch(e){next(e);}});
 r.post('/payments/:id/partial',...paymentAccess,authorize('admin','staff'),async(req,res,next)=>{
   const c=await pool.connect();
