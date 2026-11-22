@@ -31,12 +31,14 @@ function token(user){
   },env.jwtSecret,{expiresIn:env.jwtExpiresIn});
 }
 
+
 function phoneValue(v){
   const d=String(v||'').replace(/\D/g,'');
-  if(d.length===10)return `91${d}`;
-  if(d.length===11&&d.startsWith('0'))return `91${d.slice(1)}`;
+  if(d.length===10)return '91'+d;
+  if(d.length===11&&d.startsWith('0'))return '91'+d.slice(1);
   return d;
 }
+
 
 function invoiceNumber(){
   return `INV-${Date.now()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
